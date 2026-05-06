@@ -1,0 +1,4 @@
+interface:
+  display_name: "Undo"
+  short_description: "Create and restore Git-backed Codex snapshots"
+  default_prompt: "Use $undo before modifying files, or run /undo <snapshot-name> to restore a saved state."
