@@ -19,6 +19,7 @@ from pathlib import Path
 REF_PREFIX = "refs/codex-undo"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 ZERO_OID = "0" * 40
+METADATA_MARKER = "codex-undo-metadata:"
 
 
 class UndoError(RuntimeError):
@@ -71,6 +72,34 @@ def current_head(repo: Path) -> str | None:
     return None
 
 
+def list_submodule_paths(repo: Path) -> list[str]:
+    proc = run_git(
+        repo,
+        ["config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"],
+        check=False,
+    )
+    if proc.returncode != 0:
+        return []
+    paths = []
+    for line in proc.stdout.splitlines():
+        parts = line.split(" ", 1)
+        if len(parts) == 2:
+            paths.append(parts[1])
+    return paths
+
+
+def dirty_submodules(repo: Path) -> list[str]:
+    dirty = []
+    for rel in list_submodule_paths(repo):
+        path = repo / rel
+        if not path.exists():
+            continue
+        proc = run_git(path, ["status", "--porcelain=v1", "-z"], check=False)
+        if proc.returncode == 0 and proc.stdout:
+            dirty.append(rel)
+    return dirty
+
+
 def sanitize_label(label: str | None) -> str:
     if not label:
         return ""
@@ -89,7 +118,7 @@ def make_snapshot_name(label: str | None = None) -> str:
 
 
 def make_unique_ref(repo: Path, label: str | None = None) -> tuple[str, str]:
-    for _attempt in range(10):
+    for _ in range(10):
         name = make_snapshot_name(label)
         ref = ref_for_name(name)
         proc = run_git(repo, ["rev-parse", "--verify", ref], check=False)
@@ -108,7 +137,23 @@ def ref_for_name(name: str) -> str:
 
 def snapshot(repo: Path, *, label: str | None = None, include_ignored: bool = False) -> dict[str, str]:
     repo = repo.resolve()
+    submodules = dirty_submodules(repo)
+    if submodules:
+        joined = ", ".join(submodules)
+        raise UndoError(
+            "dirty submodules cannot be captured by a parent repository snapshot; "
+            f"snapshot each submodule separately first: {joined}"
+        )
+
     head = current_head(repo)
+    try:
+        index_tree = run_git(repo, ["write-tree"]).stdout.strip()
+    except UndoError as exc:
+        raise UndoError(
+            "cannot snapshot the index; resolve unmerged index entries first"
+        ) from exc
+    ignored_paths = list_untracked(repo, ignored=True)
+
     fd, index_path = tempfile.mkstemp(prefix="codex-undo-index-")
     os.close(fd)
     os.unlink(index_path)
@@ -133,6 +178,13 @@ def snapshot(repo: Path, *, label: str | None = None, include_ignored: bool = Fa
 
         tree = run_git(repo, ["write-tree"], env=env).stdout.strip()
         name, ref = make_unique_ref(repo, label)
+        metadata = {
+            "version": 2,
+            "index_tree": index_tree,
+            "worktree_tree": tree,
+            "include_ignored": include_ignored,
+            "ignored_paths": ignored_paths,
+        }
         message = "\n".join(
             [
                 f"codex undo snapshot {name}",
@@ -141,6 +193,9 @@ def snapshot(repo: Path, *, label: str | None = None, include_ignored: bool = Fa
                 f"created_utc: {datetime.now(timezone.utc).isoformat()}",
                 f"base_head: {head or '(unborn)'}",
                 f"include_ignored: {str(include_ignored).lower()}",
+                "",
+                METADATA_MARKER,
+                json.dumps(metadata, sort_keys=True),
             ]
         )
         commit_args = ["commit-tree", tree]
@@ -173,16 +228,42 @@ def zsplit(raw: str) -> list[str]:
     return [item for item in raw.split("\0") if item]
 
 
-def remove_untracked(repo: Path) -> None:
-    proc = run_git(repo, ["ls-files", "-z", "--others", "--exclude-standard"])
-    paths = sorted(zsplit(proc.stdout), key=lambda value: value.count("/"), reverse=True)
+def list_untracked(repo: Path, *, ignored: bool = False) -> list[str]:
+    args = ["ls-files", "-z", "--others"]
+    if ignored:
+        args.extend(["--ignored", "--exclude-standard"])
+    else:
+        args.append("--exclude-standard")
+    return zsplit(run_git(repo, args).stdout)
+
+
+def validate_git_path(repo: Path, rel: str) -> Path:
+    repo = repo.resolve()
+    path = Path(rel)
+    if path.is_absolute() or ".." in path.parts:
+        raise UndoError(f"refusing unsafe repository path: {rel!r}")
+    target = repo / path
+    try:
+        target.parent.resolve().relative_to(repo)
+    except ValueError:
+        raise UndoError(f"refusing to remove path outside repository: {target}")
+    return target
+
+
+def is_preserved_ignored_path(rel: str, preserved: set[str]) -> bool:
+    if rel in preserved:
+        return True
+    return any(
+        saved.endswith("/") and rel.startswith(saved)
+        for saved in preserved
+    )
+
+
+def remove_paths(repo: Path, paths: list[str]) -> None:
+    ordered = sorted(set(paths), key=lambda value: value.count("/"), reverse=True)
     touched_dirs: set[Path] = set()
-    for rel in paths:
-        target = (repo / rel).resolve()
-        try:
-            target.relative_to(repo)
-        except ValueError:
-            raise UndoError(f"refusing to remove path outside repository: {target}")
+    for rel in ordered:
+        target = validate_git_path(repo, rel)
         if target.is_symlink() or target.is_file():
             target.unlink()
             touched_dirs.add(target.parent)
@@ -200,18 +281,74 @@ def remove_untracked(repo: Path) -> None:
             current = current.parent
 
 
-def undo(repo: Path, name: str, *, no_safety_snapshot: bool = False) -> dict[str, str | None]:
+def remove_untracked(repo: Path, *, preserve_ignored_paths: set[str] | None = None) -> None:
+    paths = list_untracked(repo)
+    if preserve_ignored_paths is not None:
+        paths.extend(
+            rel
+            for rel in list_untracked(repo, ignored=True)
+            if not is_preserved_ignored_path(rel, preserve_ignored_paths)
+        )
+    remove_paths(repo, paths)
+
+
+def read_snapshot_metadata(repo: Path, commit: str) -> dict[str, object]:
+    message = run_git(repo, ["log", "-1", "--format=%B", commit]).stdout
+    lines = message.splitlines()
+    for index, line in enumerate(lines):
+        if line == METADATA_MARKER:
+            raw = "\n".join(lines[index + 1 :]).strip()
+            if not raw:
+                return {}
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise UndoError(f"invalid snapshot metadata for {commit}: {exc}") from exc
+            if not isinstance(data, dict):
+                raise UndoError(f"invalid snapshot metadata for {commit}: expected object")
+            return data
+    return {}
+
+
+def undo(
+    repo: Path,
+    name: str,
+    *,
+    no_safety_snapshot: bool = False,
+    clean_ignored: bool = False,
+) -> dict[str, str | None]:
     ref, commit = resolve_snapshot(repo, name)
+    metadata = read_snapshot_metadata(repo, commit)
+    include_ignored = metadata.get("include_ignored") is True
+    ignored_paths = metadata.get("ignored_paths")
+    preserve_ignored_paths: set[str] | None = None
+    if include_ignored:
+        preserve_ignored_paths = set()
+    elif clean_ignored:
+        if not isinstance(ignored_paths, list):
+            raise UndoError(
+                "snapshot lacks ignored-path metadata; refusing to clean ignored files"
+            )
+        preserve_ignored_paths = {item for item in ignored_paths if isinstance(item, str)}
+
     safety = None
     if not no_safety_snapshot:
         safety = snapshot(repo, label="before-undo")
 
-    remove_untracked(repo)
+    remove_untracked(repo, preserve_ignored_paths=preserve_ignored_paths)
     run_git(repo, ["read-tree", "--reset", "-u", commit])
+
+    index_tree = metadata.get("index_tree")
+    restored_index_tree = None
+    if isinstance(index_tree, str) and index_tree:
+        run_git(repo, ["read-tree", "--reset", index_tree])
+        restored_index_tree = index_tree
+
     return {
         "restored_snapshot_name": ref.rsplit("/", 1)[-1],
         "restored_snapshot_ref": ref,
         "restored_snapshot_commit": commit,
+        "restored_index_tree": restored_index_tree,
         "safety_snapshot_name": safety["snapshot_name"] if safety else None,
         "safety_snapshot_ref": safety["snapshot_ref"] if safety else None,
         "repository": str(repo),
@@ -243,7 +380,7 @@ def list_snapshots(repo: Path) -> list[dict[str, str]]:
 
 
 def show_snapshot(repo: Path, name: str) -> str:
-    _ref, commit = resolve_snapshot(repo, name)
+    commit = resolve_snapshot(repo, name)[1]
     return run_git(repo, ["show", "--stat", "--summary", "--no-renames", commit]).stdout
 
 
@@ -290,7 +427,19 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument(
         "--no-safety-snapshot",
         action="store_true",
-        help="Do not snapshot the current state before restoring.",
+        help=(
+            "Do not snapshot the current state before restoring. Dangerous: current "
+            "tracked and untracked changes may be unrecoverable."
+        ),
+    )
+    restore.add_argument(
+        "--clean-ignored",
+        action="store_true",
+        help=(
+            "For snapshots that did not include ignored file contents, remove ignored "
+            "paths that were not present when the snapshot was created. Ignored files "
+            "that already existed may still have modified contents."
+        ),
     )
 
     subparsers.add_parser("list", help="List Codex undo snapshots.", parents=[common])
@@ -309,7 +458,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "snapshot":
             result = snapshot(repo, label=args.label, include_ignored=args.include_ignored)
         elif args.command == "undo":
-            result = undo(repo, args.snapshot_name, no_safety_snapshot=args.no_safety_snapshot)
+            result = undo(
+                repo,
+                args.snapshot_name,
+                no_safety_snapshot=args.no_safety_snapshot,
+                clean_ignored=args.clean_ignored,
+            )
         elif args.command == "list":
             result = list_snapshots(repo)
         elif args.command == "show":
