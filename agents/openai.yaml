@@ -1,4 +1,4 @@
 interface:
-  display_name: "Codex Undo"
-  short_description: "Create and restore Git-backed Codex edit snapshots"
-  default_prompt: "Create a codex-undo snapshot before Codex modifies files in a Git worktree. Use /undo <snapshot-name> to restore a saved state."
+  display_name: "Undo Snapshot"
+  short_description: "Create and restore Git-backed edit snapshots"
+  default_prompt: "Create an undo-snapshot checkpoint before modifying files in a Git worktree, and restore a named snapshot when requested."

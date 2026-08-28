@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create and restore Git-backed Codex undo snapshots."""
+"""Create and restore Git-backed undo snapshots for coding agents."""
 
 from __future__ import annotations
 
@@ -16,10 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-REF_PREFIX = "refs/codex-undo"
+REF_PREFIX = "refs/undo-snapshot"
+LEGACY_REF_PREFIXES = ("refs/codex-undo",)
+REF_PREFIXES = (REF_PREFIX, *LEGACY_REF_PREFIXES)
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 ZERO_OID = "0" * 40
-METADATA_MARKER = "codex-undo-metadata:"
+METADATA_MARKER = "undo-snapshot-metadata:"
+METADATA_MARKERS = (METADATA_MARKER, "codex-undo-metadata:")
+MAX_SUBMODULE_DEPTH = 8
 
 
 class UndoError(RuntimeError):
@@ -88,16 +92,68 @@ def list_submodule_paths(repo: Path) -> list[str]:
     return paths
 
 
-def dirty_submodules(repo: Path) -> list[str]:
-    dirty = []
-    for rel in list_submodule_paths(repo):
-        path = repo / rel
-        if not path.exists():
+def validate_submodule_path(repo: Path, rel: str) -> Path:
+    repo = repo.resolve()
+    path = Path(rel)
+    if not rel or path == Path(".") or path.is_absolute() or ".." in path.parts:
+        raise UndoError(f"refusing unsafe submodule path: {rel!r}")
+
+    target = repo / path
+    try:
+        resolved_target = target.resolve()
+        resolved_target.relative_to(repo)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise UndoError(f"refusing submodule path outside repository: {rel!r}") from exc
+    return target
+
+
+def is_gitlink(repo: Path, rel: str) -> bool:
+    normalized = rel.rstrip("/")
+    commands = [
+        ["ls-files", "--stage", "-z", "--", normalized],
+        ["ls-tree", "-z", "HEAD", "--", normalized],
+    ]
+    for args in commands:
+        proc = run_git(repo, args, check=False)
+        if proc.returncode != 0:
             continue
-        proc = run_git(path, ["status", "--porcelain=v1", "-z"], check=False)
-        if proc.returncode == 0 and proc.stdout:
-            dirty.append(rel)
-    return dirty
+        for entry in proc.stdout.split("\0"):
+            header, separator, entry_path = entry.partition("\t")
+            if not separator or entry_path.rstrip("/") != normalized:
+                continue
+            if header.split(" ", 1)[0] == "160000":
+                return True
+    return False
+
+
+def is_git_worktree(path: Path) -> bool:
+    proc = run_git(path, ["rev-parse", "--show-toplevel"], check=False)
+    if proc.returncode != 0:
+        return False
+    try:
+        return Path(proc.stdout.strip()).resolve() == path.resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def initialized_submodule_paths(repo: Path) -> list[str]:
+    initialized = []
+    for rel in list_submodule_paths(repo):
+        normalized = rel.rstrip("/")
+        path = validate_submodule_path(repo, normalized)
+        if not is_gitlink(repo, normalized):
+            continue
+        if not path.is_dir() or not is_git_worktree(path):
+            continue
+        initialized.append(normalized)
+    return initialized
+
+
+def is_submodule_path(rel: str, submodule_paths: set[str]) -> bool:
+    normalized = rel.rstrip("/")
+    if normalized in submodule_paths:
+        return True
+    return any(normalized.startswith(f"{sub}/") for sub in submodule_paths)
 
 
 def sanitize_label(label: str | None) -> str:
@@ -113,8 +169,8 @@ def make_snapshot_name(label: str | None = None) -> str:
     suffix = secrets.token_hex(4)
     clean_label = sanitize_label(label)
     if clean_label:
-        return f"codex-{stamp}-{clean_label}-{suffix}"
-    return f"codex-{stamp}-{suffix}"
+        return f"undo-{stamp}-{clean_label}-{suffix}"
+    return f"undo-{stamp}-{suffix}"
 
 
 def make_unique_ref(repo: Path, label: str | None = None) -> tuple[str, str]:
@@ -127,23 +183,54 @@ def make_unique_ref(repo: Path, label: str | None = None) -> tuple[str, str]:
     raise UndoError("could not allocate a unique snapshot name")
 
 
-def ref_for_name(name: str) -> str:
-    if name.startswith(f"{REF_PREFIX}/"):
-        name = name[len(REF_PREFIX) + 1 :]
+def normalize_snapshot_name(name: str) -> tuple[str, str | None]:
+    matched_prefix = None
+    for prefix in REF_PREFIXES:
+        if name.startswith(f"{prefix}/"):
+            matched_prefix = prefix
+            name = name[len(prefix) + 1 :]
+            break
     if not NAME_RE.fullmatch(name):
         raise UndoError(f"invalid snapshot name: {name!r}")
-    return f"{REF_PREFIX}/{name}"
+    return name, matched_prefix
 
 
-def snapshot(repo: Path, *, label: str | None = None, include_ignored: bool = False) -> dict[str, str]:
+def ref_for_name(name: str) -> str:
+    normalized, _ = normalize_snapshot_name(name)
+    return f"{REF_PREFIX}/{normalized}"
+
+
+def snapshot(
+    repo: Path,
+    *,
+    label: str | None = None,
+    include_ignored: bool = False,
+    depth: int = 0,
+    recurse_submodules: bool = True,
+) -> dict[str, str]:
     repo = repo.resolve()
-    submodules = dirty_submodules(repo)
-    if submodules:
-        joined = ", ".join(submodules)
+    if depth > MAX_SUBMODULE_DEPTH:
         raise UndoError(
-            "dirty submodules cannot be captured by a parent repository snapshot; "
-            f"snapshot each submodule separately first: {joined}"
+            f"submodule recursion depth {depth} exceeds limit {MAX_SUBMODULE_DEPTH}"
         )
+
+    submodule_snapshots: dict[str, dict[str, str]] = {}
+    if recurse_submodules:
+        for sub_rel in initialized_submodule_paths(repo):
+            try:
+                child = snapshot(
+                    repo / sub_rel,
+                    include_ignored=include_ignored,
+                    depth=depth + 1,
+                    recurse_submodules=True,
+                )
+            except UndoError as exc:
+                raise UndoError(f"failed to snapshot submodule {sub_rel!r}: {exc}") from exc
+            submodule_snapshots[sub_rel] = {
+                "snapshot_name": child["snapshot_name"],
+                "snapshot_ref": child["snapshot_ref"],
+                "snapshot_commit": child["snapshot_commit"],
+            }
 
     head = current_head(repo)
     try:
@@ -154,15 +241,15 @@ def snapshot(repo: Path, *, label: str | None = None, include_ignored: bool = Fa
         ) from exc
     ignored_paths = list_untracked(repo, ignored=True)
 
-    fd, index_path = tempfile.mkstemp(prefix="codex-undo-index-")
+    fd, index_path = tempfile.mkstemp(prefix="undo-snapshot-index-")
     os.close(fd)
     os.unlink(index_path)
     env = {
         "GIT_INDEX_FILE": index_path,
-        "GIT_AUTHOR_NAME": "Codex Undo",
-        "GIT_AUTHOR_EMAIL": "codex-undo@example.invalid",
-        "GIT_COMMITTER_NAME": "Codex Undo",
-        "GIT_COMMITTER_EMAIL": "codex-undo@example.invalid",
+        "GIT_AUTHOR_NAME": "Undo Snapshot",
+        "GIT_AUTHOR_EMAIL": "undo-snapshot@example.invalid",
+        "GIT_COMMITTER_NAME": "Undo Snapshot",
+        "GIT_COMMITTER_EMAIL": "undo-snapshot@example.invalid",
     }
     try:
         if head:
@@ -179,15 +266,16 @@ def snapshot(repo: Path, *, label: str | None = None, include_ignored: bool = Fa
         tree = run_git(repo, ["write-tree"], env=env).stdout.strip()
         name, ref = make_unique_ref(repo, label)
         metadata = {
-            "version": 2,
+            "version": 3,
             "index_tree": index_tree,
             "worktree_tree": tree,
             "include_ignored": include_ignored,
             "ignored_paths": ignored_paths,
+            "submodules": submodule_snapshots,
         }
         message = "\n".join(
             [
-                f"codex undo snapshot {name}",
+                f"undo snapshot {name}",
                 "",
                 f"repository: {repo}",
                 f"created_utc: {datetime.now(timezone.utc).isoformat()}",
@@ -217,11 +305,16 @@ def snapshot(repo: Path, *, label: str | None = None, include_ignored: bool = Fa
 
 
 def resolve_snapshot(repo: Path, name: str) -> tuple[str, str]:
-    ref = ref_for_name(name)
-    proc = run_git(repo, ["rev-parse", "--verify", f"{ref}^{{commit}}"], check=False)
-    if proc.returncode != 0:
-        raise UndoError(f"snapshot not found: {name}")
-    return ref, proc.stdout.strip()
+    normalized, matched_prefix = normalize_snapshot_name(name)
+    prefixes = (matched_prefix,) if matched_prefix else REF_PREFIXES
+    for prefix in prefixes:
+        ref = f"{prefix}/{normalized}"
+        proc = run_git(
+            repo, ["rev-parse", "--verify", f"{ref}^{{commit}}"], check=False
+        )
+        if proc.returncode == 0:
+            return ref, proc.stdout.strip()
+    raise UndoError(f"snapshot not found: {name}")
 
 
 def zsplit(raw: str) -> list[str]:
@@ -281,7 +374,12 @@ def remove_paths(repo: Path, paths: list[str]) -> None:
             current = current.parent
 
 
-def remove_untracked(repo: Path, *, preserve_ignored_paths: set[str] | None = None) -> None:
+def remove_untracked(
+    repo: Path,
+    *,
+    preserve_ignored_paths: set[str] | None = None,
+    preserve_paths: set[str] | None = None,
+) -> None:
     paths = list_untracked(repo)
     if preserve_ignored_paths is not None:
         paths.extend(
@@ -289,6 +387,12 @@ def remove_untracked(repo: Path, *, preserve_ignored_paths: set[str] | None = No
             for rel in list_untracked(repo, ignored=True)
             if not is_preserved_ignored_path(rel, preserve_ignored_paths)
         )
+    if preserve_paths:
+        paths = [
+            rel
+            for rel in paths
+            if not is_submodule_path(rel, preserve_paths)
+        ]
     remove_paths(repo, paths)
 
 
@@ -296,7 +400,7 @@ def read_snapshot_metadata(repo: Path, commit: str) -> dict[str, object]:
     message = run_git(repo, ["log", "-1", "--format=%B", commit]).stdout
     lines = message.splitlines()
     for index, line in enumerate(lines):
-        if line == METADATA_MARKER:
+        if line in METADATA_MARKERS:
             raw = "\n".join(lines[index + 1 :]).strip()
             if not raw:
                 return {}
@@ -316,7 +420,14 @@ def undo(
     *,
     no_safety_snapshot: bool = False,
     clean_ignored: bool = False,
-) -> dict[str, str | None]:
+    depth: int = 0,
+) -> dict[str, str | list[str] | None]:
+    if depth > MAX_SUBMODULE_DEPTH:
+        raise UndoError(
+            f"submodule recursion depth {depth} exceeds limit {MAX_SUBMODULE_DEPTH}"
+        )
+
+    repo = repo.resolve()
     ref, commit = resolve_snapshot(repo, name)
     metadata = read_snapshot_metadata(repo, commit)
     include_ignored = metadata.get("include_ignored") is True
@@ -331,11 +442,35 @@ def undo(
             )
         preserve_ignored_paths = {item for item in ignored_paths if isinstance(item, str)}
 
+    # Submodule metadata is empty for v2 snapshots, which keeps undo backward compatible.
+    submodule_snapshots = metadata.get("submodules")
+    submodule_map: dict[str, dict[str, str]] = {}
+    if isinstance(submodule_snapshots, dict):
+        for key, value in submodule_snapshots.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                child_name = value.get("snapshot_name")
+                if isinstance(child_name, str) and child_name:
+                    normalized = key.rstrip("/")
+                    try:
+                        validate_submodule_path(repo, normalized)
+                    except UndoError as exc:
+                        raise UndoError(
+                            f"invalid submodule path in snapshot metadata: {key!r}"
+                        ) from exc
+                    submodule_map[normalized] = value
+
     safety = None
     if not no_safety_snapshot:
         safety = snapshot(repo, label="before-undo")
 
-    remove_untracked(repo, preserve_ignored_paths=preserve_ignored_paths)
+    # Never let parent cleanup delete submodule directories; their contents are
+    # restored separately from their own snapshots.
+    submodule_dirs = set(initialized_submodule_paths(repo))
+    remove_untracked(
+        repo,
+        preserve_ignored_paths=preserve_ignored_paths,
+        preserve_paths=submodule_dirs,
+    )
     run_git(repo, ["read-tree", "--reset", "-u", commit])
 
     index_tree = metadata.get("index_tree")
@@ -344,11 +479,36 @@ def undo(
         run_git(repo, ["read-tree", "--reset", index_tree])
         restored_index_tree = index_tree
 
+    # Restore submodules after the parent tree so the final submodule state is
+    # decided by each submodule snapshot rather than by the parent gitlink.
+    restored_submodules = []
+    for sub_rel, child in submodule_map.items():
+        sub_path = validate_submodule_path(repo, sub_rel)
+        if (
+            not is_gitlink(repo, sub_rel)
+            or not sub_path.is_dir()
+            or not is_git_worktree(sub_path)
+        ):
+            continue
+        try:
+            # The root safety snapshot already captured submodules recursively.
+            undo(
+                sub_path,
+                child["snapshot_name"],
+                no_safety_snapshot=True,
+                clean_ignored=clean_ignored,
+                depth=depth + 1,
+            )
+            restored_submodules.append(sub_rel)
+        except UndoError as exc:
+            raise UndoError(f"failed to undo submodule {sub_rel!r}: {exc}") from exc
+
     return {
         "restored_snapshot_name": ref.rsplit("/", 1)[-1],
         "restored_snapshot_ref": ref,
         "restored_snapshot_commit": commit,
         "restored_index_tree": restored_index_tree,
+        "restored_submodules": sorted(restored_submodules),
         "safety_snapshot_name": safety["snapshot_name"] if safety else None,
         "safety_snapshot_ref": safety["snapshot_ref"] if safety else None,
         "repository": str(repo),
@@ -362,7 +522,7 @@ def list_snapshots(repo: Path) -> list[dict[str, str]]:
             "for-each-ref",
             "--sort=-creatordate",
             "--format=%(refname) %(objectname) %(creatordate:iso8601) %(subject)",
-            REF_PREFIX,
+            *REF_PREFIXES,
         ],
     )
     rows = []
@@ -411,7 +571,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     snap = subparsers.add_parser(
-        "snapshot", help="Create a Codex undo snapshot.", parents=[common]
+        "snapshot", help="Create a Git-backed undo snapshot.", parents=[common]
     )
     snap.add_argument("--label", help="Optional short label to include in the snapshot name.")
     snap.add_argument(
@@ -419,9 +579,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include ignored files. Use only when planned edits target ignored paths.",
     )
+    snap.add_argument(
+        "--no-recurse-submodules",
+        action="store_true",
+        help=(
+            "Do not recurse into submodules. Dirty submodule contents are then not "
+            "captured by the parent snapshot."
+        ),
+    )
 
     restore = subparsers.add_parser(
-        "undo", help="Restore a saved Codex undo snapshot.", parents=[common]
+        "undo", help="Restore a saved undo snapshot.", parents=[common]
     )
     restore.add_argument("snapshot_name", help="Snapshot name returned by the snapshot command.")
     restore.add_argument(
@@ -442,9 +610,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    subparsers.add_parser("list", help="List Codex undo snapshots.", parents=[common])
+    subparsers.add_parser("list", help="List undo snapshots.", parents=[common])
     show = subparsers.add_parser(
-        "show", help="Show one Codex undo snapshot.", parents=[common]
+        "show", help="Show one undo snapshot.", parents=[common]
     )
     show.add_argument("snapshot_name", help="Snapshot name to inspect.")
     return parser
@@ -456,7 +624,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         repo = repo_root(args.repo)
         if args.command == "snapshot":
-            result = snapshot(repo, label=args.label, include_ignored=args.include_ignored)
+            result = snapshot(
+                repo,
+                label=args.label,
+                include_ignored=args.include_ignored,
+                recurse_submodules=not args.no_recurse_submodules,
+            )
         elif args.command == "undo":
             result = undo(
                 repo,

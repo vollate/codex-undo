@@ -1,0 +1,23 @@
+{
+  "name": "undo-snapshot",
+  "version": "0.1.0",
+  "description": "Git-backed safety snapshots for Pi and other coding agents",
+  "keywords": [
+    "pi-package",
+    "agent-skill",
+    "git",
+    "snapshot",
+    "undo"
+  ],
+  "files": [
+    "agents/openai.yaml",
+    "scripts/undo_snapshot.py",
+    "SKILL.md",
+    "README.md"
+  ],
+  "pi": {
+    "skills": [
+      "./SKILL.md"
+    ]
+  }
+}
